@@ -196,11 +196,14 @@ type HeadOptions struct {
 	// without requiring 1.5x the chunk range worth of data in the head.
 	TimelyCompaction bool
 
-	PostingsForMatchersCacheTTL      time.Duration
-	PostingsForMatchersCacheMaxItems int
-	PostingsForMatchersCacheMaxBytes int64
-	PostingsForMatchersCacheForce    bool
-	PostingsForMatchersCacheMetrics  *PostingsForMatchersCacheMetrics
+	PostingsForMatchersCacheTTL             time.Duration
+	PostingsForMatchersCacheMaxItems        int
+	PostingsForMatchersCacheMaxBytes        int64
+	PostingsForMatchersCacheForce           bool
+	PostingsForMatchersCacheInvalidation    bool
+	PostingsForMatchersCacheVersions        int
+	PostingsForMatchersCacheVersionsStripes int
+	PostingsForMatchersCacheMetrics         *PostingsForMatchersCacheMetrics
 
 	// Optional hash function applied to each new series. Computed hash value is preserved for each series in the head,
 	// and values can be iterated by using Head.ForEachSecondaryHash method.
@@ -216,22 +219,25 @@ const (
 
 func DefaultHeadOptions() *HeadOptions {
 	ho := &HeadOptions{
-		ChunkRange:                       DefaultBlockDuration,
-		ChunkDirRoot:                     "",
-		ChunkPool:                        chunkenc.NewPool(),
-		ChunkWriteBufferSize:             chunks.DefaultWriteBufferSize,
-		ChunkEndTimeVariance:             0,
-		ChunkWriteQueueSize:              chunks.DefaultWriteQueueSize,
-		SamplesPerChunk:                  DefaultSamplesPerChunk,
-		StripeSize:                       DefaultStripeSize,
-		SeriesCallback:                   &noopSeriesLifecycleCallback{},
-		IsolationDisabled:                defaultIsolationDisabled,
-		PostingsForMatchersCacheTTL:      DefaultPostingsForMatchersCacheTTL,
-		PostingsForMatchersCacheMaxItems: DefaultPostingsForMatchersCacheMaxItems,
-		PostingsForMatchersCacheMaxBytes: DefaultPostingsForMatchersCacheMaxBytes,
-		PostingsForMatchersCacheForce:    DefaultPostingsForMatchersCacheForce,
-		PostingsForMatchersCacheMetrics:  NewPostingsForMatchersCacheMetrics(nil),
-		WALReplayConcurrency:             defaultWALReplayConcurrency,
+		ChunkRange:                              DefaultBlockDuration,
+		ChunkDirRoot:                            "",
+		ChunkPool:                               chunkenc.NewPool(),
+		ChunkWriteBufferSize:                    chunks.DefaultWriteBufferSize,
+		ChunkEndTimeVariance:                    0,
+		ChunkWriteQueueSize:                     chunks.DefaultWriteQueueSize,
+		SamplesPerChunk:                         DefaultSamplesPerChunk,
+		StripeSize:                              DefaultStripeSize,
+		SeriesCallback:                          &noopSeriesLifecycleCallback{},
+		IsolationDisabled:                       defaultIsolationDisabled,
+		PostingsForMatchersCacheTTL:             DefaultPostingsForMatchersCacheTTL,
+		PostingsForMatchersCacheMaxItems:        DefaultPostingsForMatchersCacheMaxItems,
+		PostingsForMatchersCacheMaxBytes:        DefaultPostingsForMatchersCacheMaxBytes,
+		PostingsForMatchersCacheForce:           DefaultPostingsForMatchersCacheForce,
+		PostingsForMatchersCacheInvalidation:    DefaultPostingsForMatchersCacheInvalidation,
+		PostingsForMatchersCacheVersions:        DefaultPostingsForMatchersCacheVersions,
+		PostingsForMatchersCacheVersionsStripes: DefaultPostingsForMatchersCacheVersionsStripes,
+		PostingsForMatchersCacheMetrics:         NewPostingsForMatchersCacheMetrics(nil),
+		WALReplayConcurrency:                    defaultWALReplayConcurrency,
 	}
 	ho.OutOfOrderCapMax.Store(DefaultOutOfOrderCapMax)
 	return ho
@@ -305,7 +311,9 @@ func NewHead(r prometheus.Registerer, l *slog.Logger, wal, wbl *wlog.WL, opts *H
 		stats:             stats,
 		reg:               r,
 		secondaryHashFunc: shf,
-		pfmc:              NewPostingsForMatchersCache(opts.PostingsForMatchersCacheTTL, opts.PostingsForMatchersCacheMaxItems, opts.PostingsForMatchersCacheMaxBytes, opts.PostingsForMatchersCacheForce, opts.PostingsForMatchersCacheMetrics, []attribute.KeyValue{attribute.String("block", headULID.String())}),
+		pfmc: NewPostingsForMatchersCache(opts.PostingsForMatchersCacheTTL, opts.PostingsForMatchersCacheMaxItems, opts.PostingsForMatchersCacheMaxBytes,
+			opts.PostingsForMatchersCacheForce, opts.PostingsForMatchersCacheInvalidation, opts.PostingsForMatchersCacheVersions, opts.PostingsForMatchersCacheVersionsStripes,
+			opts.PostingsForMatchersCacheMetrics, []attribute.KeyValue{attribute.String("block", headULID.String())}),
 	}
 	if err := h.resetInMemoryState(); err != nil {
 		return nil, err

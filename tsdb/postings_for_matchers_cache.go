@@ -5,12 +5,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/DmitriyVTitov/size"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/otel/attribute"
@@ -21,15 +24,19 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/index"
+	promSync "github.com/prometheus/prometheus/util/sync"
 )
 
 const (
 	// NOTE: keep them exported to reference them in Mimir.
 
-	DefaultPostingsForMatchersCacheTTL      = 10 * time.Second
-	DefaultPostingsForMatchersCacheMaxItems = 100
-	DefaultPostingsForMatchersCacheMaxBytes = 10 * 1024 * 1024 // DefaultPostingsForMatchersCacheMaxBytes is based on the default max items, 10MB / 100 = 100KB per cached entry on average.
-	DefaultPostingsForMatchersCacheForce    = false
+	DefaultPostingsForMatchersCacheTTL             = 10 * time.Second
+	DefaultPostingsForMatchersCacheMaxItems        = 100
+	DefaultPostingsForMatchersCacheMaxBytes        = 10 * 1024 * 1024 // DefaultPostingsForMatchersCacheMaxBytes is based on the default max items, 10MB / 100 = 100KB per cached entry on average.
+	DefaultPostingsForMatchersCacheForce           = false
+	DefaultPostingsForMatchersCacheInvalidation    = false
+	DefaultPostingsForMatchersCacheVersions        = 64 * 1024 // The number of metric versions to store across all metric names
+	DefaultPostingsForMatchersCacheVersionsStripes = 64        // The number of locks to use to guard the metric versions
 )
 
 const (
@@ -63,8 +70,18 @@ type IndexPostingsReader interface {
 // NewPostingsForMatchersCache creates a new PostingsForMatchersCache.
 // If `ttl` is 0, then it only deduplicates in-flight requests.
 // If `force` is true, then all requests go through cache, regardless of the `concurrent` param provided to the PostingsForMatchers method.
+// If `invalidation` is true, then cache entries for head blocks will be invalidated when postings change for a metric.
+// `cacheVersions` will be used to size the metric versions cache when `invalidation` is enabled.
+// `cacheVersionStripes` will be used to size the striped lock that guards the versions cache when `invalidation` is enabled.
 // The `tracingKV` parameter allows passing additional attributes for tracing purposes, which are appended to the default attributes.
-func NewPostingsForMatchersCache(ttl time.Duration, maxItems int, maxBytes int64, force bool, metrics *PostingsForMatchersCacheMetrics, tracingKV []attribute.KeyValue) *PostingsForMatchersCache {
+func NewPostingsForMatchersCache(ttl time.Duration, maxItems int, maxBytes int64, force bool, invalidation bool, cacheVersions int, cacheVersionsStripes int, metrics *PostingsForMatchersCacheMetrics, tracingKV []attribute.KeyValue) *PostingsForMatchersCache {
+	var mv *metricVersions
+	if invalidation {
+		mv = &metricVersions{
+			versions:    make([]int, cacheVersions),
+			stripedLock: promSync.NewStripedLock(cacheVersionsStripes),
+		}
+	}
 	b := &PostingsForMatchersCache{
 		calls:            &sync.Map{},
 		cached:           list.New(),
@@ -83,18 +100,24 @@ func NewPostingsForMatchersCache(ttl time.Duration, maxItems int, maxBytes int64
 		postingsForMatchers: PostingsForMatchers,
 		// Clone the slice so we don't end up sharding it with the parent.
 		additionalAttributes: append(slices.Clone(tracingKV), attribute.Stringer("ttl", ttl), attribute.Bool("force", force)),
+		metricVersions:       mv,
 	}
 
 	return b
 }
 
 // PostingsForMatchersCache caches PostingsForMatchers call results when the concurrent hint is passed in or force is true.
+//
+// Invalidation of cache entries is supported for head blocks. Cache entries are partially keyed by a version per metric
+// name, and the version is incremented via ExpireSeries, effectively invalidating all previous entries for the metric
+// name. Invalidation is lazy, where expired series become orphaned until they're later evicted.
 type PostingsForMatchersCache struct {
 	calls *sync.Map
 
-	cachedMtx   sync.RWMutex
-	cached      *list.List
-	cachedBytes int64
+	cachedMtx      sync.RWMutex
+	cached         *list.List
+	cachedBytes    int64
+	metricVersions *metricVersions // Tracks versions for metric names, enabling per-metric invalidation
 
 	ttl      time.Duration
 	maxItems int
@@ -123,6 +146,20 @@ type PostingsForMatchersCache struct {
 	additionalAttributes []attribute.KeyValue
 }
 
+// ExpireSeries invalidates cache entries for a metric name by incrementing its version.
+func (c *PostingsForMatchersCache) ExpireSeries(metric labels.Labels) {
+	if c.metricVersions == nil {
+		return
+	}
+
+	metricName := metric.Get(labels.MetricName)
+	if metricName == "" {
+		return
+	}
+
+	c.metricVersions.incrementVersion(metricName)
+}
+
 func (c *PostingsForMatchersCache) PostingsForMatchers(ctx context.Context, ix IndexPostingsReader, concurrent bool, ms ...*labels.Matcher) (index.Postings, error) {
 	c.metrics.requests.Inc()
 
@@ -135,7 +172,18 @@ func (c *PostingsForMatchersCache) PostingsForMatchers(ctx context.Context, ix I
 		)
 	}(time.Now())
 
-	if !concurrent && !c.force {
+	var metricVersion int
+	var labelOnlyMatchers bool
+	if c.metricVersions != nil && isHeadBlockReader(ix) {
+		// Only cache head blocks if they have a metric name matcher, since this is required to perform proper invalidation
+		if metricName, ok := metricNameFromMatchers(ms); !ok {
+			labelOnlyMatchers = true
+		} else {
+			metricVersion = c.metricVersions.getVersion(metricName)
+		}
+	}
+
+	if (!concurrent && !c.force) || labelOnlyMatchers {
 		c.metrics.skipsBecauseIneligible.Inc()
 		span.AddEvent("cache not used", trace.WithAttributes(c.additionalAttributes...))
 
@@ -149,12 +197,64 @@ func (c *PostingsForMatchersCache) PostingsForMatchers(ctx context.Context, ix I
 
 	span.AddEvent("using cache", trace.WithAttributes(c.additionalAttributes...))
 	c.expire()
-	p, err := c.postingsForMatchersPromise(ctx, ix, ms)(ctx)
+	p, err := c.postingsForMatchersPromise(ctx, ix, metricVersion, ms)(ctx)
 	if err != nil {
 		span.SetStatus(codes.Error, "getting postings for matchers with cache failed")
 		span.RecordError(err)
 	}
 	return p, err
+}
+
+func isHeadBlockReader(ix IndexPostingsReader) bool {
+	if blockReader, ok := ix.(interface{ BlockID() ulid.ULID }); ok {
+		return blockReader.BlockID() == headULID
+	}
+	return false
+}
+
+// metricNameFromMatchers extracts the metric name from matchers if there's an equal matcher for __name__.
+func metricNameFromMatchers(ms []*labels.Matcher) (string, bool) {
+	for _, m := range ms {
+		if m.Name == labels.MetricName && m.Type == labels.MatchEqual {
+			return m.Value, true
+		}
+	}
+	return "", false
+}
+
+// metricVersions stores versions for metric names, guarded by a StripedLock for low contention access.
+type metricVersions struct {
+	versions    []int
+	stripedLock *promSync.StripedLock
+}
+
+// GetVersion gets the version for the metricName.
+func (mv *metricVersions) getVersion(metricName string) int {
+	var version int
+	vi := mv.getIndex(metricName)
+	mv.stripedLock.WithRLock(vi, func() {
+		version = mv.versions[vi]
+	})
+	return version
+}
+
+// IncrementVersion atomically increments the version for the metricName.
+func (mv *metricVersions) incrementVersion(metricName string) {
+	vi := mv.getIndex(metricName)
+	mv.stripedLock.WithLock(vi, func() {
+		mv.versions[vi]++
+	})
+}
+
+func (mv *metricVersions) getIndex(metricName string) int {
+	return int(hashKey(metricName) % uint64(len(mv.versions)))
+}
+
+// hashKey calculates a 64-bit hash for the metricName.
+func hashKey(metricName string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(metricName))
+	return h.Sum64()
 }
 
 type postingsForMatcherPromise struct {
@@ -199,7 +299,7 @@ func (p *postingsForMatcherPromise) result(ctx context.Context) (index.Postings,
 	}
 }
 
-func (c *PostingsForMatchersCache) postingsForMatchersPromise(ctx context.Context, ix IndexPostingsReader, ms []*labels.Matcher) func(context.Context) (index.Postings, error) {
+func (c *PostingsForMatchersCache) postingsForMatchersPromise(ctx context.Context, ix IndexPostingsReader, metricVersion int, ms []*labels.Matcher) func(context.Context) (index.Postings, error) {
 	span := trace.SpanFromContext(ctx)
 
 	promiseCallersCtxTracker, promiseExecCtx := newContextsTracker()
@@ -217,7 +317,7 @@ func (c *PostingsForMatchersCache) postingsForMatchersPromise(ctx context.Contex
 	// Skipping the error checking because it can't happen here.
 	_ = promise.callersCtxTracker.add(ctx)
 
-	key := matchersKey(ms)
+	key := matchersKeyWithVersion(metricVersion, ms...)
 
 	if oldPromiseValue, loaded := c.calls.LoadOrStore(key, promise); loaded {
 		// The new promise hasn't been stored because there's already an in-flight promise
@@ -330,7 +430,7 @@ func (c *PostingsForMatchersCache) expire() {
 	}
 
 	// Ensure there's no other cleanup in progress. It's not a technical issue if there are two ongoing cleanups,
-	// but it's a waste of resources and it adds extra pressure to the mutex. One cleanup at a time is enough.
+	// but it's a waste of resources, and it adds extra pressure to the mutex. One cleanup at a time is enough.
 	if !c.expireInProgress.CompareAndSwap(false, true) {
 		return
 	}
@@ -474,16 +574,43 @@ func (c *PostingsForMatchersCache) onPromiseExecutionDone(ctx context.Context, k
 // NOTE: different orders of matchers will produce different keys,
 // but it's unlikely that we'll receive same matchers in different orders at the same time.
 func matchersKey(ms []*labels.Matcher) string {
+	return matchersKeyWithVersion(0, ms...)
+}
+
+// matchersKeyWithVersion provides a unique string key for the given version and matchers slice.
+func matchersKeyWithVersion(version int, ms ...*labels.Matcher) string {
+	// Sort matchers for consistent cache keys
+	slices.SortFunc(ms, func(i, j *labels.Matcher) int {
+		if i.Type != j.Type {
+			return int(i.Type - j.Type)
+		}
+		if i.Name != j.Name {
+			return strings.Compare(i.Name, j.Name)
+		}
+		if i.Value != j.Value {
+			return strings.Compare(i.Value, j.Value)
+		}
+		return 0
+	})
+
 	const (
 		typeLen = 2
 		sepLen  = 1
 	)
-	var size int
+	versionStr := ""
+	if version != 0 {
+		versionStr = strconv.Itoa(version)
+	}
+	size := len(versionStr) + typeLen + sepLen
 	for _, m := range ms {
 		size += len(m.Name) + len(m.Value) + typeLen + sepLen
 	}
 	sb := strings.Builder{}
 	sb.Grow(size)
+	if version != 0 {
+		sb.WriteString(versionStr)
+		sb.WriteByte('|')
+	}
 	for _, m := range ms {
 		sb.WriteString(m.Name)
 		sb.WriteString(m.Type.String())
@@ -626,6 +753,13 @@ type PostingsForMatchersCacheMetrics struct {
 	evictionsBecauseMaxBytes prometheus.Counter
 	evictionsBecauseMaxItems prometheus.Counter
 	evictionsBecauseUnknown  prometheus.Counter
+
+	// Enhanced metrics for compatibility with Cortex
+	CacheRequests       *prometheus.CounterVec
+	CacheHits           *prometheus.CounterVec
+	CacheMiss           *prometheus.CounterVec
+	CacheEvicts         *prometheus.CounterVec
+	NonCacheableQueries *prometheus.CounterVec
 }
 
 func NewPostingsForMatchersCacheMetrics(reg prometheus.Registerer) *PostingsForMatchersCacheMetrics {
@@ -685,5 +819,27 @@ func NewPostingsForMatchersCacheMetrics(reg prometheus.Registerer) *PostingsForM
 			Help:        evictionsHelp,
 			ConstLabels: map[string]string{"reason": "unknown"},
 		}),
+
+		// Enhanced metrics for compatibility with Cortex
+		CacheRequests: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "expanded_postings_cache_requests_total",
+			Help: "Total number of requests to the cache.",
+		}, []string{"cache"}),
+		CacheHits: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "expanded_postings_cache_hits_total",
+			Help: "Total number of hit requests to the cache.",
+		}, []string{"cache"}),
+		CacheMiss: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "expanded_postings_cache_miss_total",
+			Help: "Total number of miss requests to the cache.",
+		}, []string{"cache", "reason"}),
+		CacheEvicts: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "expanded_postings_cache_evicts_total",
+			Help: "Total number of evictions in the cache, excluding items that got evicted due to TTL.",
+		}, []string{"cache", "reason"}),
+		NonCacheableQueries: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "expanded_postings_non_cacheable_queries_total",
+			Help: "Total number of non cacheable queries.",
+		}, []string{"cache"}),
 	}
 }
